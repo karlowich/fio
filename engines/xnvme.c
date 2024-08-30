@@ -63,9 +63,12 @@ struct xnvme_fioe_data {
 	struct iovec *iovec;
 	struct iovec *md_iovec;
 
+	/* Index used for registering buffers */
+	struct io_u **io_u_index;
+
 	struct xnvme_fioe_fwrap files[];
 };
-XNVME_STATIC_ASSERT(sizeof(struct xnvme_fioe_data) == 64, "Incorrect size")
+XNVME_STATIC_ASSERT(sizeof(struct xnvme_fioe_data) == 72, "Incorrect size")
 
 struct xnvme_fioe_request {
 	/* Context for NVMe PI */
@@ -86,6 +89,7 @@ struct xnvme_fioe_options {
 	unsigned int apptag;
 	unsigned int apptag_mask;
 	unsigned int prchk;
+	unsigned int fixedbufs;
 	char *xnvme_be;
 	char *xnvme_mem;
 	char *xnvme_async;
@@ -252,6 +256,16 @@ static struct fio_option options[] = {
 	},
 
 	{
+		.name	= "fixedbufs",
+		.lname	= "Fixed (pre-mapped) IO buffers",
+		.type	= FIO_OPT_STR_SET,
+		.off1	= offsetof(struct xnvme_fioe_options, fixedbufs),
+		.help	= "Pre map IO buffers",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_XNVME,
+	},
+
+	{
 		.name = NULL,
 	},
 };
@@ -342,6 +356,7 @@ static void xnvme_fioe_cleanup(struct thread_data *td)
 	free(xd->iocq);
 	free(xd->iovec);
 	free(xd->md_iovec);
+	free(xd->io_u_index);
 	free(xd);
 	td->io_ops_data = NULL;
 }
@@ -531,6 +546,8 @@ static int xnvme_fioe_init(struct thread_data *td)
 		}
 	}
 
+	xd->io_u_index = calloc(td->o.iodepth, sizeof(struct io_u *));
+
 	xd->prev = -1;
 	td->io_ops_data = xd;
 
@@ -621,6 +638,9 @@ static int xnvme_fioe_io_u_init(struct thread_data *td, struct io_u *io_u)
 		}
 	}
 
+	/* save io_u in index for registering later*/
+	xd->io_u_index[io_u->index] = io_u;
+
 	io_u->engine_data = fio_req;
 
 	return 0;
@@ -650,6 +670,49 @@ static void xnvme_fioe_io_u_free(struct thread_data *td, struct io_u *io_u)
 	free(fio_req);
 
 	io_u->mmap_data = NULL;
+}
+
+static int xnvme_fioe_post_init(struct thread_data *td)
+{
+	struct xnvme_fioe_options *o = td->eo;
+	struct xnvme_fioe_data *xd = td->io_ops_data;
+	struct xnvme_fioe_fwrap *fwrap;
+	struct iovec *iovecs;
+	struct xnvme_cmd_ctx *ctx;
+
+	struct io_u *io_u;
+
+	int err, i;
+
+	if (!o->fixedbufs)
+		return 0;
+
+	iovecs = calloc(td->o.iodepth, sizeof(struct iovec));
+
+
+	/* construct iovecs for registering buffers */
+	for (i = 0; i < td->o.iodepth; i++) {
+		struct iovec *iov = &iovecs[i];
+
+		io_u = xd->io_u_index[i];
+		iov->iov_base = io_u->buf;
+		iov->iov_len = td_max_bs(td);
+	}
+
+	/* register all buffers for every queue */
+	for (i = 0; i < xd->nallocated; i++) {
+		fwrap = &xd->files[i];
+		ctx = xnvme_queue_get_cmd_ctx(fwrap->queue);
+		err = xnvme_cmd_pass_iov(ctx, iovecs, td->o.iodepth, 0, NULL, 0);
+		if (err) {
+			log_err("ioeng->post_init(): failed registering buffers\n");
+			return 1;
+		}
+		xnvme_queue_put_cmd_ctx(ctx->async.queue, ctx);
+	}
+
+	free(iovecs);
+	return 0;
 }
 
 static struct io_u *xnvme_fioe_event(struct thread_data *td, int event)
@@ -845,7 +908,9 @@ static enum fio_q_status xnvme_fioe_queue(struct thread_data *td, struct io_u *i
 					      NULL, 0, 0);
 		}
 	} else {
-		if (fwrap->md_nbytes && fwrap->lba_pow2)
+		if(o->fixedbufs)
+			err = xnvme_cmd_pass(ctx, io_u->xfer_buf, io_u->xfer_buflen, NULL, io_u->index);
+		else if (fwrap->md_nbytes && fwrap->lba_pow2)
 			err = xnvme_cmd_pass(ctx, io_u->xfer_buf, io_u->xfer_buflen,
 					     fio_req->md_buf, fwrap->md_nbytes * (nlb + 1));
 		else
@@ -1364,6 +1429,8 @@ FIO_STATIC struct ioengine_ops ioengine = {
 
 	.io_u_free = xnvme_fioe_io_u_free,
 	.io_u_init = xnvme_fioe_io_u_init,
+
+	.post_init = xnvme_fioe_post_init,
 
 	.event = xnvme_fioe_event,
 	.getevents = xnvme_fioe_getevents,
